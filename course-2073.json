@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-LarsRan",
+  "user": "LarsRan",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "9f64f7e168fead2e36096371d625b81d6039628e"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "39528243182",
+    "runAttempt": "1"
+  }
+}
