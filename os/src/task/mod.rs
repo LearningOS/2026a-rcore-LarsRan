@@ -1,30 +1,22 @@
 //! Task management implementation
 //!
-//! Everything about task management, like starting and switching tasks is
-//! implemented here.
-//!
-//! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
-//! all the tasks in the operating system.
-//!
-//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
-//! might not be what you expect.
+//! Everything about task management, like starting and switching tasks, is
+//! implemented here. A single global [`TaskManager`] controls all tasks.
 
 mod context;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
 use crate::mm::MapPermission;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
+pub use context::TaskContext;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
-pub use context::TaskContext;
 
 /// The task manager, where all the tasks are managed.
 pub struct TaskManager {
@@ -65,7 +57,7 @@ lazy_static! {
 }
 
 impl TaskManager {
-    /// Run the first task in task list.
+    /// Run the first task in the task list.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
@@ -79,21 +71,21 @@ impl TaskManager {
         panic!("unreachable in run_first_task!");
     }
 
-    /// Change the status of current `Running` task into `Ready`.
+    /// Change the current running task's status to ready.
     fn mark_current_suspended(&self) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].task_status = TaskStatus::Ready;
     }
 
-    /// Change the status of current `Running` task into `Exited`.
+    /// Change the current running task's status to exited.
     fn mark_current_exited(&self) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].task_status = TaskStatus::Exited;
     }
 
-    /// Find next task to run and return task id.
+    /// Find the next ready task.
     fn find_next_task(&self) -> Option<usize> {
         let inner = self.inner.exclusive_access();
         let current = inner.current_task;
@@ -102,29 +94,26 @@ impl TaskManager {
             .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
     }
 
-    /// Get the current 'Running' task's token.
+    /// Get the current running task's page-table token.
     fn get_current_token(&self) -> usize {
         let inner = self.inner.exclusive_access();
         inner.tasks[inner.current_task].get_user_token()
     }
 
-    /// Get the current 'Running' task's trap contexts.
+    /// Get the current running task's trap context.
     fn get_current_trap_cx(&self) -> &'static mut TrapContext {
         let inner = self.inner.exclusive_access();
         inner.tasks[inner.current_task].get_trap_cx()
     }
 
-    /// Change the current 'Running' task's program break
+    /// Change the current 'Running' task's program break.
     pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].change_program_brk(size)
     }
 
-    /// Map a new area into the current 'Running' task's address space.
-    ///
-    /// The whole operation happens inside one `exclusive_access()` borrow, so
-    /// the `RefMut` is released before returning and no `&mut` escapes.
+    /// Map a range in the current task's address space.
     fn mmap_current_task(&self, start: usize, len: usize, permission: MapPermission) -> bool {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
@@ -133,34 +122,28 @@ impl TaskManager {
             .mmap_area(start, len, permission)
     }
 
-    /// Unmap an area from the current 'Running' task's address space.
+    /// Unmap an exact range from the current task's address space.
     fn munmap_current_task(&self, start: usize, len: usize) -> bool {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].memory_set.munmap_area(start, len)
     }
 
-    /// Get the syscall count of the current task.
+    /// Get the current task's count for `syscall_id`.
     fn get_current_syscall_count(&self, syscall_id: usize) -> usize {
         let inner = self.inner.exclusive_access();
         let cur = inner.current_task;
-        if syscall_id < MAX_SYSCALL_NUM {
-            inner.tasks[cur].syscall_count[syscall_id]
-        } else {
-            0
-        }
+        inner.tasks[cur].get_syscall_count(syscall_id)
     }
 
-    /// Increase the syscall count of the current task.
+    /// Record an invocation of `syscall_id` by the current task.
     fn increase_current_syscall_count(&self, syscall_id: usize) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
-        if syscall_id < MAX_SYSCALL_NUM {
-            inner.tasks[cur].syscall_count[syscall_id] += 1;
-        }
+        inner.tasks[cur].record_syscall(syscall_id);
     }
 
-    /// Switch current `Running` task to the task we have found.
+    /// Switch from the current running task to the next ready task.
     fn run_next_task(&self) {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
@@ -184,17 +167,17 @@ pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
 }
 
-/// Switch current `Running` task to the task we have found.
+/// Switch the current running task to the next ready task.
 fn run_next_task() {
     TASK_MANAGER.run_next_task();
 }
 
-/// Change the status of current `Running` task into `Ready`.
+/// Mark the current running task ready.
 fn mark_current_suspended() {
     TASK_MANAGER.mark_current_suspended();
 }
 
-/// Change the status of current `Running` task into `Exited`.
+/// Mark the current running task exited.
 fn mark_current_exited() {
     TASK_MANAGER.mark_current_exited();
 }
@@ -221,17 +204,17 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
 }
 
-/// Change the current 'Running' task's program break
+/// Change the current 'Running' task's program break.
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
 }
 
-/// Map a new area into the current 'Running' task's address space.
+/// Map a range in the current task's address space.
 pub fn current_task_mmap(start: usize, len: usize, permission: MapPermission) -> bool {
     TASK_MANAGER.mmap_current_task(start, len, permission)
 }
 
-/// Unmap an area from the current 'Running' task's address space.
+/// Unmap an exact range from the current task's address space.
 pub fn current_task_munmap(start: usize, len: usize) -> bool {
     TASK_MANAGER.munmap_current_task(start, len)
 }

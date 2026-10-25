@@ -172,7 +172,7 @@ impl MemorySet {
                 if ph_flags.is_write() {
                     map_perm |= MapPermission::W;
                 }
-                if ph_flags.is_executable() {
+                if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
@@ -268,67 +268,63 @@ impl MemorySet {
 
     /// Map a new framed area for `mmap`.
     ///
-    /// * `start` must be page-aligned and `len` must be non-zero.
-    /// * The requested range is rounded UP to whole pages, so the mapping
-    ///   covers every byte the caller asked for, i.e. the pages
-    ///   `[start / PAGE_SIZE, ceil((start + len) / PAGE_SIZE))`.
-    /// * If the range overlaps with an existing mapping, `false` is returned
-    ///   and nothing is changed.
+    /// `start` must be page-aligned and `len` must be non-zero. The requested
+    /// range is rounded up to whole pages. The operation fails without
+    /// changing the address space if the page ranges overlap.
     pub fn mmap_area(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
         if start % PAGE_SIZE != 0 || len == 0 {
             return false;
         }
         let end = match start.checked_add(len) {
-            Some(e) => e,
+            Some(end) => end,
             None => return false,
         };
         if end > crate::mm::MAX_USER_VA {
             return false;
         }
         let start_page = start / PAGE_SIZE;
-        // `len` is rounded UP to a whole number of pages, so that a request
-        // like `mmap(start, len + 1, prot)` still covers every byte the
-        // caller asked for.
-        let mut end_page = (end + PAGE_SIZE - 1) / PAGE_SIZE;
-        if end_page <= start_page {
-            // at least one page is mapped
-            end_page = start_page + 1;
-        }
-        // check conflicts with the existing areas
-        for area in self.areas.iter() {
-            let a = area.vpn_range.get_start().0;
-            let b = area.vpn_range.get_end().0;
-            if a < b && start_page < b && a < end_page {
+        let end_page = match end.checked_add(PAGE_SIZE - 1) {
+            Some(rounded_end) => rounded_end / PAGE_SIZE,
+            None => return false,
+        };
+        for area in &self.areas {
+            let area_start = area.vpn_range.get_start().0;
+            let area_end = area.vpn_range.get_end().0;
+            if start_page < area_end && area_start < end_page {
                 return false;
             }
         }
-        let start_va = VirtAddr::from(start_page * PAGE_SIZE);
-        let end_va = VirtAddr::from(end_page * PAGE_SIZE);
-        self.insert_framed_area(start_va, end_va, permission);
+        self.insert_framed_area(
+            VirtAddr::from(start),
+            VirtAddr::from(end_page * PAGE_SIZE),
+            permission,
+        );
         true
     }
 
-    /// Unmap the area which exactly covers `[start, start + len)`.
+    /// Unmap the area that exactly covers `[start, start + len)`.
     ///
-    /// * `start` must be page-aligned and `len` must be a positive multiple of
-    ///   the page size, otherwise `false` is returned.
-    /// * The area must exist in this memory set, otherwise `false` is returned.
+    /// `start` must be page-aligned and `len` must be a positive multiple of
+    /// the page size. The complete area must exist in this memory set.
     pub fn munmap_area(&mut self, start: usize, len: usize) -> bool {
         if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
             return false;
         }
         let end = match start.checked_add(len) {
-            Some(e) => e,
+            Some(end) => end,
             None => return false,
         };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
         let start_page = start / PAGE_SIZE;
         let end_page = end / PAGE_SIZE;
         let idx = self.areas.iter().position(|area| {
             area.vpn_range.get_start().0 == start_page && area.vpn_range.get_end().0 == end_page
         });
         match idx {
-            Some(i) => {
-                let mut area = self.areas.remove(i);
+            Some(idx) => {
+                let mut area = self.areas.remove(idx);
                 area.unmap(&mut self.page_table);
                 true
             }

@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -30,7 +30,7 @@ pub struct TaskControlBlock {
     pub program_brk: usize,
 
     /// Syscall count array
-    pub syscall_count: [usize; 500],
+    pub syscall_count: [usize; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -66,7 +66,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
-            syscall_count: [0; 500],
+            syscall_count: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -98,6 +98,18 @@ impl TaskControlBlock {
             Some(old_break)
         } else {
             None
+        }
+    }
+
+    /// Return how many times this task has invoked `syscall_id`.
+    pub(super) fn get_syscall_count(&self, syscall_id: usize) -> usize {
+        self.syscall_count.get(syscall_id).copied().unwrap_or(0)
+    }
+
+    /// Record one invocation of `syscall_id` by this task.
+    pub(super) fn record_syscall(&mut self, syscall_id: usize) {
+        if let Some(count) = self.syscall_count.get_mut(syscall_id) {
+            *count += 1;
         }
     }
 }

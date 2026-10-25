@@ -1,4 +1,5 @@
 //! Process management syscalls
+
 use crate::config::PAGE_SIZE;
 use crate::mm::{read_user_byte, translated_byte_buffer_checked, write_user_byte, MapPermission};
 use crate::task::{
@@ -9,26 +10,29 @@ use crate::timer::get_time_us;
 
 #[repr(C)]
 #[derive(Debug)]
+/// Time represented as whole seconds and microseconds.
 pub struct TimeVal {
+    /// Seconds elapsed.
     pub sec: usize,
+    /// Microseconds within the current second.
     pub usec: usize,
 }
 
-/// task exits and submit an exit code
+/// Task exits and submits an exit code.
 pub fn sys_exit(_exit_code: i32) -> ! {
     trace!("kernel: sys_exit");
     exit_current_and_run_next();
     panic!("Unreachable in sys_exit!");
 }
 
-/// current task gives up resources for other tasks
+/// Current task gives up the CPU for other tasks.
 pub fn sys_yield() -> isize {
     trace!("kernel: sys_yield");
     suspend_current_and_run_next();
     0
 }
 
-/// get time with second and microsecond
+/// Get time with second and microsecond precision.
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
     let token = current_user_token();
@@ -37,8 +41,6 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
     };
-    // The `ts` pointer lives in the user address space, so it must be
-    // translated through the current task's page table.
     let mut buf = match translated_byte_buffer_checked(
         token,
         ts as *const u8,
@@ -63,11 +65,10 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-/// sys_trace
+/// Trace a user address or report the current task's syscall count.
 ///
-/// * `TraceRequest::Read` (0): read one byte from the user address `id`.
-/// * `TraceRequest::Write` (1): write one byte `data` to the user address `id`.
-/// * `TraceRequest::Syscall` (2): return how many times syscall `id` was called.
+/// Request `0` reads one user byte, request `1` writes one user byte, and
+/// request `2` returns the count for syscall `id`.
 pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
     trace!("kernel: sys_trace");
     let token = current_user_token();
@@ -88,16 +89,13 @@ pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
     }
 }
 
-/// Implement mmap.
+/// Map a page-aligned user range with Linux-style read/write/execute bits.
 ///
-/// `prot` uses the same encoding as Linux: bit0 = READ, bit1 = WRITE,
-/// bit2 = EXEC. `prot == 0` or any bit above bit2 is illegal.
+/// A zero permission mask, an invalid permission bit, a misaligned start, or
+/// any overlap with an existing mapping is rejected with `-1`.
 pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     trace!("kernel: sys_mmap");
-    if start % PAGE_SIZE != 0 || len == 0 {
-        return -1;
-    }
-    if prot == 0 || prot > 0b111 {
+    if start % PAGE_SIZE != 0 || len == 0 || prot == 0 || prot & !0b111 != 0 {
         return -1;
     }
     let mut map_perm = MapPermission::U;
@@ -117,10 +115,7 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     }
 }
 
-/// Implement munmap.
-///
-/// `start` must be page-aligned and `len` must be a positive multiple of the
-/// page size, and the range must correspond to an existing mapping.
+/// Unmap an existing mapping that exactly matches the requested page range.
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!("kernel: sys_munmap");
     if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
@@ -133,7 +128,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
 }
 
-/// change data segment size
+/// Change the current task's data segment size.
 pub fn sys_sbrk(size: i32) -> isize {
     trace!("kernel: sys_sbrk");
     if let Some(old_brk) = change_program_brk(size) {
