@@ -33,10 +33,13 @@ lazy_static! {
     pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> =
         Arc::new(unsafe { UPSafeCell::new(MemorySet::new_kernel()) });
 }
+
 /// address space
 pub struct MemorySet {
-    page_table: PageTable,
-    areas: Vec<MapArea>,
+    /// The page table of this memory set.
+    pub page_table: PageTable,
+    /// The mapped areas in this memory set.
+    pub areas: Vec<MapArea>,
 }
 
 impl MemorySet {
@@ -169,7 +172,7 @@ impl MemorySet {
                 if ph_flags.is_write() {
                     map_perm |= MapPermission::W;
                 }
-                if ph_flags.is_execute() {
+                if ph_flags.is_executable() {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
@@ -262,16 +265,89 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map a new framed area for `mmap`.
+    ///
+    /// * `start` must be page-aligned and `len` must be non-zero.
+    /// * The requested range is rounded UP to whole pages, so the mapping
+    ///   covers every byte the caller asked for, i.e. the pages
+    ///   `[start / PAGE_SIZE, ceil((start + len) / PAGE_SIZE))`.
+    /// * If the range overlaps with an existing mapping, `false` is returned
+    ///   and nothing is changed.
+    pub fn mmap_area(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
+        let start_page = start / PAGE_SIZE;
+        // `len` is rounded UP to a whole number of pages, so that a request
+        // like `mmap(start, len + 1, prot)` still covers every byte the
+        // caller asked for.
+        let mut end_page = (end + PAGE_SIZE - 1) / PAGE_SIZE;
+        if end_page <= start_page {
+            // at least one page is mapped
+            end_page = start_page + 1;
+        }
+        // check conflicts with the existing areas
+        for area in self.areas.iter() {
+            let a = area.vpn_range.get_start().0;
+            let b = area.vpn_range.get_end().0;
+            if a < b && start_page < b && a < end_page {
+                return false;
+            }
+        }
+        let start_va = VirtAddr::from(start_page * PAGE_SIZE);
+        let end_va = VirtAddr::from(end_page * PAGE_SIZE);
+        self.insert_framed_area(start_va, end_va, permission);
+        true
+    }
+
+    /// Unmap the area which exactly covers `[start, start + len)`.
+    ///
+    /// * `start` must be page-aligned and `len` must be a positive multiple of
+    ///   the page size, otherwise `false` is returned.
+    /// * The area must exist in this memory set, otherwise `false` is returned.
+    pub fn munmap_area(&mut self, start: usize, len: usize) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        let start_page = start / PAGE_SIZE;
+        let end_page = end / PAGE_SIZE;
+        let idx = self.areas.iter().position(|area| {
+            area.vpn_range.get_start().0 == start_page && area.vpn_range.get_end().0 == end_page
+        });
+        match idx {
+            Some(i) => {
+                let mut area = self.areas.remove(i);
+                area.unmap(&mut self.page_table);
+                true
+            }
+            None => false,
+        }
+    }
 }
+
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
-    vpn_range: VPNRange,
+    /// The range of virtual page numbers.
+    pub vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
     map_perm: MapPermission,
 }
 
 impl MapArea {
+    /// Create a new MapArea.
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -287,6 +363,7 @@ impl MapArea {
             map_perm,
         }
     }
+    /// Map one virtual page number to physical page number.
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -303,24 +380,28 @@ impl MapArea {
         page_table.map(vpn, ppn, pte_flags);
     }
     #[allow(unused)]
+    /// Unmap one virtual page number.
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    /// Map all virtual page numbers in this area.
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// Unmap all virtual page numbers in this area.
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// Shrink the area to a new end.
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
@@ -328,6 +409,7 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
+    /// Append the area to a new end.
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
@@ -358,10 +440,12 @@ impl MapArea {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum MapType {
+    /// Identical mapping
     Identical,
+    /// Framed mapping
     Framed,
 }
 

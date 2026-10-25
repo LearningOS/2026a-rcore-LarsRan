@@ -5,6 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 
+/// The maximal legal user virtual address (SV39 user range is [0, 2^38)).
+pub const MAX_USER_VA: usize = 1 << 38;
+
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
@@ -69,6 +72,10 @@ impl PageTableEntry {
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is accessible in user mode?
+    pub fn user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
 }
 
@@ -178,4 +185,93 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Check whether a user virtual address range is inside the legal user range.
+fn check_user_addr(addr: usize, len: usize) -> Option<(usize, usize)> {
+    let end = addr.checked_add(len)?;
+    if addr >= MAX_USER_VA || end > MAX_USER_VA {
+        return None;
+    }
+    Some((addr, end))
+}
+
+/// Translate a user pointer into physical byte slices, checking permissions.
+///
+/// * `write == false`: every page must be valid, user-accessible and readable.
+/// * `write == true`: every page must be valid, user-accessible and writable.
+///
+/// Returns `None` instead of panicking when the pointer is illegal, so that a
+/// syscall can report an error back to the user program.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let (start, end) = check_user_addr(ptr as usize, len)?;
+    let page_table = PageTable::from_token(token);
+    let mut start = start;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.user() {
+            return None;
+        }
+        if write {
+            if !pte.writable() {
+                return None;
+            }
+        } else if !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Some(v)
+}
+
+/// Read one byte from user space. Returns `None` if the address is illegal
+/// or the page is not readable.
+pub fn read_user_byte(token: usize, addr: usize) -> Option<u8> {
+    let (start, _) = check_user_addr(addr, 1)?;
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(start);
+    let pte = page_table.translate(va.floor())?;
+    if !pte.is_valid() || !pte.user() || !pte.readable() {
+        return None;
+    }
+    let bytes = pte.ppn().get_bytes_array();
+    Some(bytes[va.page_offset()])
+}
+
+/// Write one byte into user space. Returns `false` if the address is illegal
+/// or the page is not writable.
+pub fn write_user_byte(token: usize, addr: usize, data: u8) -> bool {
+    let (start, _) = match check_user_addr(addr, 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(start);
+    let pte = match page_table.translate(va.floor()) {
+        Some(p) => p,
+        None => return false,
+    };
+    if !pte.is_valid() || !pte.user() || !pte.writable() {
+        return false;
+    }
+    let bytes = pte.ppn().get_bytes_array();
+    bytes[va.page_offset()] = data;
+    true
 }
