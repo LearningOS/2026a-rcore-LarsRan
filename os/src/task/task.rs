@@ -9,6 +9,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+const DEFAULT_PRIORITY: usize = 16;
+const STRIDE_BASE: usize = 1 << 32;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -36,6 +39,7 @@ impl TaskControlBlock {
     }
 }
 
+/// Mutable process state protected by its task-control block.
 pub struct TaskControlBlockInner {
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
@@ -68,20 +72,33 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Scheduling priority; larger values receive proportionally more CPU time.
+    pub priority: usize,
+
+    /// Amount added to `pass` whenever this task is queued.
+    pub stride: usize,
+
+    /// Virtual scheduling pass used by the weighted stride scheduler.
+    pub pass: usize,
+
+    /// Child pid being waited for, or `-1` for any child.
+    pub waiting_for: Option<isize>,
 }
 
 impl TaskControlBlockInner {
-    /// get the trap context
+    /// Get the trap context.
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
-    /// get the user token
+    /// Get the user page-table token.
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
+    /// Return whether this task has exited but has not yet been reaped.
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
@@ -118,6 +135,10 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: DEFAULT_PRIORITY,
+                    stride: STRIDE_BASE / DEFAULT_PRIORITY,
+                    pass: 0,
+                    waiting_for: None,
                 })
             },
         };
@@ -150,6 +171,8 @@ impl TaskControlBlock {
         inner.trap_cx_ppn = trap_cx_ppn;
         // initialize base_size
         inner.base_size = user_sp;
+        inner.heap_bottom = user_sp;
+        inner.program_brk = user_sp;
         // initialize trap_cx
         let trap_cx = inner.get_trap_cx();
         *trap_cx = TrapContext::app_init_context(
@@ -191,6 +214,10 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride: parent_inner.stride,
+                    pass: 0,
+                    waiting_for: None,
                 })
             },
         });
@@ -209,6 +236,49 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Map a user range into this process's address space.
+    pub fn mmap(&self, start: usize, len: usize, permission: crate::mm::MapPermission) -> bool {
+        self.inner_exclusive_access()
+            .memory_set
+            .mmap_area(start, len, permission)
+    }
+
+    /// Unmap an exact range from this process's address space.
+    pub fn munmap(&self, start: usize, len: usize) -> bool {
+        self.inner_exclusive_access()
+            .memory_set
+            .munmap_area(start, len)
+    }
+
+    /// Set this task's scheduling priority.
+    ///
+    /// Priorities below two are rejected.
+    pub fn set_priority(&self, priority: usize) -> bool {
+        if priority < 2 {
+            return false;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        inner.stride = (STRIDE_BASE / priority).max(1);
+        true
+    }
+
+    /// Return the priority value used by the scheduler.
+    pub fn priority(&self) -> usize {
+        self.inner_exclusive_access().priority
+    }
+
+    /// Return the current virtual scheduling pass.
+    pub fn pass(&self) -> usize {
+        self.inner_exclusive_access().pass
+    }
+
+    /// Reserve one quantum for a task entering the ready queue.
+    pub fn reserve_quantum(&self) {
+        let mut inner = self.inner_exclusive_access();
+        inner.pass = inner.pass.saturating_add(inner.stride);
     }
 
     /// change the location of the program break. return None if failed.
@@ -239,14 +309,16 @@ impl TaskControlBlock {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-/// task status: UnInit, Ready, Running, Exited
+/// Process lifecycle and scheduler state.
 pub enum TaskStatus {
-    /// uninitialized
+    /// Not initialized yet.
     UnInit,
-    /// ready to run
+    /// Ready to run.
     Ready,
-    /// running
+    /// Currently running.
     Running,
-    /// exited
+    /// Exited and waiting for its parent to reap it.
     Zombie,
+    /// Waiting for a condition and not queued for execution.
+    Blocked,
 }

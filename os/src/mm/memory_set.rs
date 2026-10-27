@@ -60,7 +60,7 @@ impl MemorySet {
             None,
         );
     }
-    /// remove a area
+    /// Remove the area beginning at `start_vpn`.
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
             .areas
@@ -266,9 +266,74 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
-    ///Remove all `MapArea`
+    /// Remove all mapped areas and release their data frames.
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+    }
+
+    /// Map a page-aligned range and allocate its physical data frames.
+    ///
+    /// The requested length is rounded up to a whole number of pages. The
+    /// operation fails without changing the address space if the page range
+    /// overlaps an existing mapping or leaves the legal user address range.
+    pub fn mmap_area(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
+        let start_page = start / PAGE_SIZE;
+        let end_page = match end.checked_add(PAGE_SIZE - 1) {
+            Some(rounded_end) => rounded_end / PAGE_SIZE,
+            None => return false,
+        };
+        for area in &self.areas {
+            let area_start = area.vpn_range.get_start().0;
+            let area_end = area.vpn_range.get_end().0;
+            if start_page < area_end && area_start < end_page {
+                return false;
+            }
+        }
+        self.insert_framed_area(
+            VirtAddr::from(start),
+            VirtAddr::from(end_page * PAGE_SIZE),
+            permission,
+        );
+        true
+    }
+
+    /// Unmap a range that exactly matches one existing mapping.
+    ///
+    /// `start` must be page-aligned and `len` must be a positive multiple of
+    /// the page size.
+    pub fn munmap_area(&mut self, start: usize, len: usize) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
+        let start_page = start / PAGE_SIZE;
+        let end_page = end / PAGE_SIZE;
+        let idx = self.areas.iter().position(|area| {
+            area.vpn_range.get_start().0 == start_page && area.vpn_range.get_end().0 == end_page
+        });
+        if let Some(idx) = idx {
+            let mut area = self.areas.remove(idx);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
     }
 
     /// shrink the area to new_end
@@ -303,6 +368,7 @@ impl MemorySet {
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
+    /// Virtual page range covered by this area.
     vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
@@ -310,6 +376,7 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    /// Create a mapping for the virtual range `[start_va, end_va)`.
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -325,6 +392,7 @@ impl MapArea {
             map_perm,
         }
     }
+    /// Create an empty copy of another mapping with the same range and flags.
     pub fn from_another(another: &Self) -> Self {
         Self {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
@@ -333,6 +401,7 @@ impl MapArea {
             map_perm: another.map_perm,
         }
     }
+    /// Map one virtual page to a physical page.
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -348,22 +417,26 @@ impl MapArea {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
+    /// Unmap one virtual page and release its data frame.
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    /// Map every page in this area.
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
+    /// Unmap every page in this area.
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
+    /// Shrink this mapping to `new_end`.
     #[allow(unused)]
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
@@ -371,6 +444,7 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+    /// Extend this mapping to `new_end`.
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
@@ -405,20 +479,22 @@ impl MapArea {
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {
+    /// Physical address equals virtual address.
     Identical,
+    /// Physical frames are allocated for this mapping.
     Framed,
 }
 
 bitflags! {
     /// map permission corresponding to that in pte: `R W X U`
     pub struct MapPermission: u8 {
-        ///Readable
+        /// Readable.
         const R = 1 << 1;
-        ///Writable
+        /// Writable.
         const W = 1 << 2;
-        ///Excutable
+        /// Executable.
         const X = 1 << 3;
-        ///Accessible in U mode
+        /// Accessible from user mode.
         const U = 1 << 4;
     }
 }
