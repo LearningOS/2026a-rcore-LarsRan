@@ -86,6 +86,13 @@ pub struct DiskInode {
     pub indirect1: u32,
     pub indirect2: u32,
     type_: DiskInodeType,
+    /// Number of hard links pointing to this inode.
+    ///
+    /// A freshly created inode owns exactly one link, i.e. the directory
+    /// entry which was created together with it. `link` increases this
+    /// counter, `unlink` decreases it, and the inode (together with all its
+    /// data blocks) is reclaimed as soon as it drops to zero.
+    pub nlink: u32,
 }
 
 impl DiskInode {
@@ -97,6 +104,8 @@ impl DiskInode {
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;
+        // a newly created inode is referenced by exactly one directory entry
+        self.nlink = 1;
     }
     /// Whether this inode is a directory
     pub fn is_dir(&self) -> bool {
@@ -407,12 +416,18 @@ impl DirEntry {
     }
     /// Crate a directory entry from name and inode number
     pub fn new(name: &str, inode_id: u32) -> Self {
+        assert!(Self::is_valid_name(name), "invalid file name");
         let mut bytes = [0u8; NAME_LENGTH_LIMIT + 1];
         bytes[..name.len()].copy_from_slice(name.as_bytes());
         Self {
             name: bytes,
             inode_id,
         }
+    }
+    /// Check that a name is non-empty, fits in a directory entry and contains
+    /// no NUL byte.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty() && name.len() <= NAME_LENGTH_LIMIT && !name.as_bytes().contains(&0)
     }
     /// Serialize into bytes
     pub fn as_bytes(&self) -> &[u8] {

@@ -24,6 +24,7 @@ mod task;
 
 use crate::fs::{open_file, OpenFlags};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 pub use context::TaskContext;
 use lazy_static::*;
 pub use manager::{fetch_task, TaskManager};
@@ -31,13 +32,17 @@ use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-pub use manager::add_task;
+pub use manager::{add_task, has_ready_task};
+pub use manager::{block_task, wake_waiters_for};
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
     Processor,
 };
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
+    if !has_ready_task() {
+        return;
+    }
     // There must be an application running.
     let task = take_current_task().unwrap();
 
@@ -52,6 +57,21 @@ pub fn suspend_current_and_run_next() {
     // push back to ready queue.
     add_task(task);
     // jump to scheduling cycle
+    schedule(task_cx_ptr);
+}
+
+/// Block the current task until its child `pid` exits, then resume scheduling.
+///
+/// A negative `pid` waits for any child.
+pub fn wait_current_and_run_next(pid: isize) {
+    let task = take_current_task().unwrap();
+    let task_cx_ptr = {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Blocked;
+        inner.waiting_for = Some(pid);
+        &mut inner.task_cx as *mut TaskContext
+    };
+    block_task(task);
     schedule(task_cx_ptr);
 }
 
@@ -78,21 +98,34 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     inner.task_status = TaskStatus::Zombie;
     // Record exit code
     inner.exit_code = exit_code;
+    // Wake a parent that is blocked in waitpid.
+    wake_waiters_for(pid);
     // do not move to its parent but under initproc
 
     // ++++++ access initproc TCB exclusively
+    let mut reparented_zombies = Vec::new();
     {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
         for child in inner.children.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
             initproc_inner.children.push(child.clone());
+            if child.inner_exclusive_access().is_zombie() {
+                reparented_zombies.push(child.getpid());
+            }
         }
+    }
+    for child_pid in reparented_zombies {
+        wake_waiters_for(child_pid);
     }
     // ++++++ release parent PCB
 
     inner.children.clear();
     // deallocate user space
     inner.memory_set.recycle_data_pages();
+    // flush files that were still open when the process exited
+    for file in inner.fd_table.iter().flatten() {
+        file.sync();
+    }
     // drop file descriptors
     inner.fd_table.clear();
     drop(inner);

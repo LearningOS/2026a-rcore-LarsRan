@@ -3,7 +3,9 @@
 #[allow(unused)]
 
 /// user app's stack size
-pub const USER_STACK_SIZE: usize = 4096 * 2;
+pub const USER_STACK_SIZE: usize = 4096 * 8;
+/// Number of inaccessible pages reserved below each user stack.
+pub const USER_STACK_GUARD_PAGES: usize = 4;
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
 /// kernel heap size

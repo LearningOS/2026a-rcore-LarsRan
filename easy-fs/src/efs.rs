@@ -17,6 +17,12 @@ pub struct EasyFileSystem {
     data_area_start_block: u32,
 }
 
+impl Drop for EasyFileSystem {
+    fn drop(&mut self) {
+        block_cache_sync_all();
+    }
+}
+
 type DataBlock = [u8; BLOCK_SZ];
 /// An easy fs over a block device
 impl EasyFileSystem {
@@ -109,7 +115,7 @@ impl EasyFileSystem {
         // acquire efs lock temporarily
         let (block_id, block_offset) = efs.lock().get_disk_inode_pos(0);
         // release efs lock
-        Inode::new(block_id, block_offset, Arc::clone(efs), block_device)
+        Inode::new(0, block_id, block_offset, Arc::clone(efs), block_device)
     }
     /// Get inode by id
     pub fn get_disk_inode_pos(&self, inode_id: u32) -> (u32, usize) {
@@ -120,6 +126,21 @@ impl EasyFileSystem {
             block_id,
             (inode_id % inodes_per_block) as usize * inode_size,
         )
+    }
+    /// Get the inode number which is stored at the given position.
+    ///
+    /// This is the inverse of [`Self::get_disk_inode_pos`].
+    pub fn get_inode_id(&self, block_id: u32, block_offset: usize) -> u32 {
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+        assert_eq!(
+            block_offset % inode_size,
+            0,
+            "the offset must be the start of an inode"
+        );
+        assert!(block_id >= self.inode_area_start_block);
+        (block_id - self.inode_area_start_block) * inodes_per_block
+            + (block_offset / inode_size) as u32
     }
     /// Get data block by id
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
@@ -147,5 +168,23 @@ impl EasyFileSystem {
             &self.block_device,
             (block_id - self.data_area_start_block) as usize,
         )
+    }
+    /// Deallocate an inode whose last link has just been removed.
+    ///
+    /// The on-disk inode is zeroed and its bit in the inode bitmap is
+    /// released, so that the inode number can be allocated again.
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        // clear the on-disk inode first, so that a stale reference can never
+        // observe the old content
+        let (block_id, block_offset) = self.get_disk_inode_pos(inode_id);
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |disk_inode: &mut DiskInode| {
+                disk_inode.initialize(DiskInodeType::File);
+                disk_inode.nlink = 0;
+            });
+        // release the inode number
+        self.inode_bitmap
+            .dealloc(&self.block_device, inode_id as usize);
     }
 }

@@ -3,7 +3,10 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
+use crate::config::{
+    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_GUARD_PAGES,
+    USER_STACK_SIZE,
+};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -214,7 +217,7 @@ impl MemorySet {
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
         // guard page
-        user_stack_bottom += PAGE_SIZE;
+        user_stack_bottom += PAGE_SIZE * USER_STACK_GUARD_PAGES;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
         memory_set.push(
             MapArea::new(
@@ -284,9 +287,70 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
-    ///Remove all `MapArea`
+    /// Remove all mapped areas and release their data frames.
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+    }
+
+    /// Map a page-aligned range and allocate its physical data frames.
+    ///
+    /// The requested length is rounded up to whole pages. Existing mappings
+    /// cannot overlap the new mapping.
+    pub fn mmap_area(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
+        let start_page = start / PAGE_SIZE;
+        let end_page = match end.checked_add(PAGE_SIZE - 1) {
+            Some(rounded_end) => rounded_end / PAGE_SIZE,
+            None => return false,
+        };
+        for area in &self.areas {
+            let area_start = area.vpn_range.get_start().0;
+            let area_end = area.vpn_range.get_end().0;
+            if start_page < area_end && area_start < end_page {
+                return false;
+            }
+        }
+        self.insert_framed_area(
+            VirtAddr::from(start),
+            VirtAddr::from(end_page * PAGE_SIZE),
+            permission,
+        );
+        true
+    }
+
+    /// Unmap a range that exactly matches one existing mapping.
+    pub fn munmap_area(&mut self, start: usize, len: usize) -> bool {
+        if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
+            return false;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) => end,
+            None => return false,
+        };
+        if end > crate::mm::MAX_USER_VA {
+            return false;
+        }
+        let start_page = start / PAGE_SIZE;
+        let end_page = end / PAGE_SIZE;
+        let idx = self.areas.iter().position(|area| {
+            area.vpn_range.get_start().0 == start_page && area.vpn_range.get_end().0 == end_page
+        });
+        if let Some(idx) = idx {
+            let mut area = self.areas.remove(idx);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
     }
 
     /// shrink the area to new_end

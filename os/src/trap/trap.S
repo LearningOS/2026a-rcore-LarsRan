@@ -48,7 +48,8 @@ __restore:
     # switch to user space
     csrw satp, a1
     sfence.vma
-    csrw sscratch, a0
+    fence rw, rw
+    fence.i
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it
     # restore sstatus/sepc
@@ -64,8 +65,10 @@ __restore:
         LOAD_GP %n
         .set n, n+1
     .endr
-    # back to user stack
-    ld sp, 2*8(sp)
+    # Restore the user stack through sscratch as the final register step.
+    ld t0, 2*8(sp)
+    csrw sscratch, t0
+    csrrw sp, sscratch, sp
     sret
 
     .section .data
@@ -83,4 +86,4 @@ __emergency_end:
     .align 2
 __trap_from_kernel:
     la sp, __emergency_end
-    j trap_from_kernel    
+    j trap_from_kernel

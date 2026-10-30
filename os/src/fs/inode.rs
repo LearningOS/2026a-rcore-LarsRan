@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
-
 /// inode in memory
 /// A wrapper around a filesystem inode
 /// to implement File trait atop
@@ -125,12 +124,69 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Create a hard link named `new_name` which points to the same inode as
+/// `old_name`.
+///
+/// Returns 0 on success, -1 if `old_name` does not exist, if `new_name` is
+/// already taken, or if both names refer to the same entry.
+pub fn link(old_name: &str, new_name: &str) -> isize {
+    // the two names must not be identical, otherwise the link count would be
+    // increased without adding a new directory entry
+    if old_name == new_name {
+        return -1;
+    }
+    let target = match ROOT_INODE.find(old_name) {
+        Some(inode) => inode,
+        None => return -1,
+    };
+    if ROOT_INODE.link(new_name, &target) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Remove the directory entry named `name` from the root directory.
+///
+/// The link count of the inode is decreased by one; if it drops to zero the
+/// inode and all its data blocks are reclaimed.
+///
+/// Returns 0 on success, -1 if there is no such entry.
+pub fn unlink(name: &str) -> isize {
+    if ROOT_INODE.unlink(name) {
+        0
+    } else {
+        -1
+    }
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+    /// Collect the status of the underlying inode.
+    ///
+    /// The `dev` field is always zero because easy-fs lives on a single
+    /// block device, while `ino` is the number of the inode inside that
+    /// device.
+    fn stat(&self) -> super::Stat {
+        let inner = self.inner.exclusive_access();
+        let inode = &inner.inode;
+        let mode = if inode.is_dir() {
+            super::StatMode::DIR
+        } else {
+            super::StatMode::FILE
+        };
+        super::Stat {
+            dev: 0,
+            ino: inode.inode_id() as u64,
+            mode,
+            nlink: inode.nlink(),
+            pad: [0; 7],
+        }
     }
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
@@ -155,5 +211,8 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn sync(&self) {
+        self.inner.exclusive_access().inode.sync();
     }
 }

@@ -1,9 +1,13 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+
+/// The exclusive upper bound of the user virtual-address range.
+pub const MAX_USER_VA: usize = 1 << 38;
 
 bitflags! {
     /// page table entry flags
@@ -61,6 +65,10 @@ impl PageTableEntry {
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
+    }
+    /// The page is accessible from user mode.
+    pub fn user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
 }
 
@@ -179,6 +187,75 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Check that a user range fits in the legal SV39 user address space.
+fn check_user_addr(addr: usize, len: usize) -> Option<(usize, usize)> {
+    let end = addr.checked_add(len)?;
+    if addr >= MAX_USER_VA || end > MAX_USER_VA {
+        None
+    } else {
+        Some((addr, end))
+    }
+}
+
+/// Translate a user range into physical byte slices after checking mappings
+/// and permissions.
+///
+/// When `write` is true every page must be user-writable; otherwise every page
+/// must be user-readable. Illegal or partially mapped ranges return `None`.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let (mut start, end) = check_user_addr(ptr as usize, len)?;
+    let page_table = PageTable::from_token(token);
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.user() {
+            return None;
+        }
+        if write {
+            if !pte.writable() {
+                return None;
+            }
+        } else if !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let end_va = VirtAddr::from(vpn).min(VirtAddr::from(end));
+        let end_offset = if end_va.page_offset() == 0 {
+            PAGE_SIZE
+        } else {
+            end_va.page_offset()
+        };
+        v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_offset]);
+        start = end_va.0;
+    }
+    Some(v)
+}
+
+/// Write an `i32` to a writable user address, including across page boundaries.
+pub fn write_user_i32(token: usize, ptr: *mut i32, value: i32) -> bool {
+    let bytes = value.to_ne_bytes();
+    let mut buffers =
+        match translated_byte_buffer_checked(token, ptr as *const u8, bytes.len(), true) {
+            Some(buffers) => buffers,
+            None => return false,
+        };
+    let mut offset = 0;
+    for buffer in buffers.iter_mut() {
+        let len = buffer.len().min(bytes.len() - offset);
+        buffer[..len].copy_from_slice(&bytes[offset..offset + len]);
+        offset += len;
+    }
+    true
 }
 
 /// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
