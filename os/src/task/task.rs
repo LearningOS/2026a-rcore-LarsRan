@@ -30,7 +30,9 @@ impl TaskControlBlock {
     }
 }
 
+/// Mutable task state protected by the task control block.
 pub struct TaskControlBlockInner {
+    /// User-space resources owned by this task.
     pub res: Option<TaskUserRes>,
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
@@ -41,9 +43,14 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
+    /// Mutex id on which this task is currently blocked.
+    pub waiting_mutex: Option<usize>,
+    /// Semaphore id on which this task is currently blocked.
+    pub waiting_semaphore: Option<usize>,
 }
 
 impl TaskControlBlockInner {
+    /// Return the mutable trap context stored in this task's trap page.
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
         self.trap_cx_ppn.get_mut()
     }
@@ -75,6 +82,8 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    waiting_mutex: None,
+                    waiting_semaphore: None,
                 })
             },
         }

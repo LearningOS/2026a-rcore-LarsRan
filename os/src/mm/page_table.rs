@@ -5,6 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 
+/// Exclusive upper bound of the SV39 user address space.
+const MAX_USER_VA: usize = 1 << 38;
+
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
@@ -57,6 +60,10 @@ impl PageTableEntry {
     /// The page pointered by page table entry is writable?
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is accessible from user mode?
+    pub fn user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
@@ -177,6 +184,53 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate a user byte range after checking every page's mapping and access bits.
+///
+/// Returns `None` for an overflow, an illegal user address, an unmapped page,
+/// or a page without the requested read or write permission.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let (mut start, end) = check_user_addr(ptr as usize, len)?;
+    let page_table = PageTable::from_token(token);
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.user() || (write && !pte.writable()) {
+            return None;
+        }
+        if !write && !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let end_va = VirtAddr::from(vpn).min(VirtAddr::from(end));
+        let end_offset = if end_va.page_offset() == 0 {
+            crate::config::PAGE_SIZE
+        } else {
+            end_va.page_offset()
+        };
+        buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_offset]);
+        start = end_va.into();
+    }
+    Some(buffers)
+}
+
+/// Check that a user byte range fits in the legal SV39 user address space.
+fn check_user_addr(addr: usize, len: usize) -> Option<(usize, usize)> {
+    let end = addr.checked_add(len)?;
+    if addr >= MAX_USER_VA || end > MAX_USER_VA {
+        None
+    } else {
+        Some((addr, end))
+    }
 }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space

@@ -26,7 +26,7 @@ use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+pub use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use context::TaskContext;
@@ -84,6 +84,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // record exit code
     task_inner.exit_code = Some(exit_code);
     task_inner.res = None;
+    if tid != 0 {
+        let mut process_inner = process.inner_exclusive_access();
+        if let Some(allocation) = process_inner.semaphore_allocations.get_mut(tid) {
+            allocation.fill(0);
+        }
+    }
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
